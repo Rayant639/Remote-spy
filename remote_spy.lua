@@ -1,26 +1,23 @@
 --[[
-    RayanSpy v2.0 — Remote Spy
-    Author  : Rayan Scripts
-    Executor: UNC-compliant (Synapse X / Delta / Wave)
-    UI      : remote_spy_ui.html @ ws://localhost:7272
+    RayanSpy v2.1 — Remote Spy (Delta-safe)
+    No WebSocket dependency — works standalone.
+    UI connection is optional, never blocks execution.
 
     _G.RayanSpy API:
-      .dump()        — print all captured remotes
-      .clear()       — wipe log + notify UI
-      .unhook()      — restore original __namecall, close socket
-      .reconnect()   — re-attempt WebSocket connection
-      .getLog()      — return raw log table
-      .count()       — return capture count
+      .dump()    — print all captured remotes to console
+      .clear()   — wipe log
+      .unhook()  — restore original __namecall
+      .getLog()  — return raw log table
+      .count()   — return capture count
 ]]
 
 -- ─── CONFIG ────────────────────────────────────────────────────
 local CONFIG = {
-    WS_PORT   = 7272,
-    WS_HOST   = "localhost",
-    MAX_LOG   = 1000,
-    PRINT_LOG = false,   -- set true to also print to executor console
+    WS_PORT    = 7272,
+    WS_HOST    = "localhost",
+    MAX_LOG    = 1000,
+    PRINT_LOG  = true,    -- print every remote to console
 
-    -- remotes to silently ignore (add game-specific noise here)
     BLACKLIST = {
         "Heartbeat", "Ping", "UpdatePosition", "PositionUpdate",
         "CharacterUpdate", "AnimationUpdate", "MouseUpdate",
@@ -28,233 +25,134 @@ local CONFIG = {
     },
 }
 
--- ─── BLACKLIST SET ──────────────────────────────────────────────
 local blacklistSet = {}
-for _, name in ipairs(CONFIG.BLACKLIST) do
-    blacklistSet[name] = true
-end
+for _, v in ipairs(CONFIG.BLACKLIST) do blacklistSet[v] = true end
 
 -- ─── STATE ─────────────────────────────────────────────────────
-local remoteLog   = {}
-local hookActive  = false
+local remoteLog  = {}
+local hookActive = false
+
+-- ─── WEBSOCKET (non-blocking, optional) ────────────────────────
 local ws          = nil
 local wsConnected = false
 
+-- Fire and forget — runs in a coroutine so it never blocks
+local function tryConnectAsync()
+    coroutine.wrap(function()
+        local ok, result = pcall(function()
+            return WebSocket.connect(
+                string.format("ws://%s:%d", CONFIG.WS_HOST, CONFIG.WS_PORT)
+            )
+        end)
+        if ok and result then
+            ws          = result
+            wsConnected = true
+            print("[RayanSpy] UI connected at ws://localhost:" .. CONFIG.WS_PORT)
+            result.OnClose:Connect(function()
+                wsConnected = false
+            end)
+        end
+        -- silently fail — UI is optional
+    end)()
+end
+
+local function sendToUI(payload)
+    if not wsConnected or not ws then return end
+    pcall(function()
+        -- inline minimal JSON
+        local function enc(v, d)
+            d = d or 0
+            local t = type(v)
+            if v == nil then return "null"
+            elseif t == "boolean" then return v and "true" or "false"
+            elseif t == "number" then
+                if v ~= v then return '"NaN"' end
+                if v == math.huge then return '"Inf"' end
+                if v == -math.huge then return '"-Inf"' end
+                if v == math.floor(v) then return tostring(math.floor(v)) end
+                return string.format("%g", v)
+            elseif t == "string" then
+                return '"' .. v:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n') .. '"'
+            elseif t == "table" and d < 6 then
+                local parts = {}
+                for k, val in pairs(v) do
+                    table.insert(parts, enc(tostring(k),d+1)..":"..enc(val,d+1))
+                end
+                return "{"..table.concat(parts,",").."}"
+            end
+            return enc(tostring(v), d)
+        end
+        ws:Send(enc(payload))
+    end)
+end
+
 -- ─── ARG SERIALIZER ────────────────────────────────────────────
--- Returns a table describing one argument, safe for JSON encoding.
 local function serializeArg(val, depth)
     depth = depth or 0
-    if depth > 4 then
-        return { type = "table", value = "(max depth)" }
-    end
+    if depth > 4 then return {type="table",value="(max depth)"} end
 
     local t = typeof(val)
 
     if val == nil then
-        return { type = "nil", value = "nil" }
-
+        return {type="nil", value="nil"}
     elseif t == "boolean" then
-        return { type = "boolean", value = val }
-
+        return {type="boolean", value=val}
     elseif t == "number" then
-        if val ~= val then
-            return { type = "number", value = "NaN" }
-        elseif val == math.huge then
-            return { type = "number", value = "Infinity" }
-        elseif val == -math.huge then
-            return { type = "number", value = "-Infinity" }
-        end
-        return { type = "number", value = val }
-
+        if val ~= val then return {type="number",value="NaN"} end
+        if val ==  math.huge then return {type="number",value="Inf"} end
+        if val == -math.huge then return {type="number",value="-Inf"} end
+        return {type="number", value=val}
     elseif t == "string" then
-        local s = val
-        if #s > 300 then s = s:sub(1, 300) .. "…" end
-        return { type = "string", value = s }
-
+        return {type="string", value=#val>256 and val:sub(1,256).."…" or val}
     elseif t == "Instance" then
-        local ok, result = pcall(function()
-            return {
-                type  = "Instance",
-                class = val.ClassName,
-                value = val:GetFullName(),
-            }
+        local ok, r = pcall(function()
+            return {type="Instance", class=val.ClassName, value=val:GetFullName()}
         end)
-        if ok then return result end
-        return { type = "Instance", class = "?", value = "(destroyed)" }
-
+        return ok and r or {type="Instance",class="?",value="(destroyed)"}
     elseif t == "Vector3" then
-        return {
-            type = "Vector3",
-            x    = math.floor(val.X * 100 + 0.5) / 100,
-            y    = math.floor(val.Y * 100 + 0.5) / 100,
-            z    = math.floor(val.Z * 100 + 0.5) / 100,
-        }
-
+        return {type="Vector3",
+            x=math.floor(val.X*100+.5)/100,
+            y=math.floor(val.Y*100+.5)/100,
+            z=math.floor(val.Z*100+.5)/100}
     elseif t == "CFrame" then
         local p = val.Position
-        return {
-            type = "CFrame",
-            x    = math.floor(p.X * 100 + 0.5) / 100,
-            y    = math.floor(p.Y * 100 + 0.5) / 100,
-            z    = math.floor(p.Z * 100 + 0.5) / 100,
-        }
-
+        return {type="CFrame",
+            x=math.floor(p.X*100+.5)/100,
+            y=math.floor(p.Y*100+.5)/100,
+            z=math.floor(p.Z*100+.5)/100}
     elseif t == "Color3" then
-        return {
-            type = "Color3",
-            r    = math.floor(val.R * 255 + 0.5),
-            g    = math.floor(val.G * 255 + 0.5),
-            b    = math.floor(val.B * 255 + 0.5),
-        }
-
+        return {type="Color3",
+            r=math.floor(val.R*255+.5),
+            g=math.floor(val.G*255+.5),
+            b=math.floor(val.B*255+.5)}
     elseif t == "EnumItem" then
-        return { type = "EnumItem", value = tostring(val) }
-
+        return {type="EnumItem", value=tostring(val)}
     elseif t == "table" then
-        -- shallow copy with cycle protection
         local ok2, tbl = pcall(function()
-            local out   = {}
-            local count = 0
+            local out, n = {}, 0
             for k, v in pairs(val) do
-                count = count + 1
-                if count > 24 then
-                    out["..."] = string.format("(%d more)", count)
-                    break
-                end
-                local ks = tostring(k)
-                local ok3, sv = pcall(serializeArg, v, depth + 1)
-                out[ks] = ok3 and sv or { type = "error", value = "unserializable" }
+                n = n + 1
+                if n > 20 then out["..."]="("..n.." more)"; break end
+                local ok3, sv = pcall(serializeArg, v, depth+1)
+                out[tostring(k)] = ok3 and sv or {type="error",value="?"}
             end
             return out
         end)
-        if ok2 then
-            return { type = "table", value = tbl }
-        end
-        return { type = "table", value = "(cyclic/inaccessible)" }
-
+        return ok2 and {type="table",value=tbl} or {type="table",value="(cyclic)"}
     else
-        return { type = t, value = tostring(val) }
+        return {type=t, value=tostring(val)}
     end
 end
 
--- Serialize the full vararg pack (preserves nil holes via .n)
-local function serializeArgs(argPack)
+local function serializeArgs(pack)
     local out = {}
-    for i = 1, argPack.n do
-        out[i] = serializeArg(argPack[i])
-    end
+    for i = 1, pack.n do out[i] = serializeArg(pack[i]) end
     return out
 end
-
--- ─── JSON ENCODER ──────────────────────────────────────────────
--- Minimal Luau JSON encoder — no external deps.
-local function jsonEncode(val, depth)
-    depth = depth or 0
-    local t = type(val)
-
-    if val == nil then
-        return "null"
-    elseif t == "boolean" then
-        return val and "true" or "false"
-    elseif t == "number" then
-        if val ~= val then return '"NaN"' end
-        if val == math.huge  then return '"Infinity"' end
-        if val == -math.huge then return '"-Infinity"' end
-        -- integers print without decimal
-        if val == math.floor(val) and math.abs(val) < 1e15 then
-            return string.format("%d", val)
-        end
-        return string.format("%g", val)
-    elseif t == "string" then
-        -- escape special chars
-        local s = val
-            :gsub('\\', '\\\\')
-            :gsub('"',  '\\"')
-            :gsub('\n', '\\n')
-            :gsub('\r', '\\r')
-            :gsub('\t', '\\t')
-        return '"' .. s .. '"'
-    elseif t == "table" then
-        if depth > 8 then return '"[max depth]"' end
-
-        -- detect array (consecutive integer keys from 1)
-        local isArray = true
-        local maxN = 0
-        for k, _ in pairs(val) do
-            if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then
-                isArray = false
-                break
-            end
-            if k > maxN then maxN = k end
-        end
-        if isArray then
-            for i = 1, maxN do
-                if val[i] == nil then isArray = false; break end
-            end
-        end
-
-        local parts = {}
-        if isArray then
-            for i = 1, maxN do
-                parts[i] = jsonEncode(val[i], depth + 1)
-            end
-            return '[' .. table.concat(parts, ',') .. ']'
-        else
-            for k, v in pairs(val) do
-                local ks = type(k) == "string" and k or tostring(k)
-                table.insert(parts, jsonEncode(ks, depth + 1) .. ':' .. jsonEncode(v, depth + 1))
-            end
-            return '{' .. table.concat(parts, ',') .. '}'
-        end
-    end
-    return '"' .. tostring(val) .. '"'
-end
-
--- ─── WEBSOCKET BRIDGE ──────────────────────────────────────────
-local function sendToUI(payload)
-    if not wsConnected or not ws then return end
-    local ok, err = pcall(function()
-        ws:Send(jsonEncode(payload))
-    end)
-    if not ok then
-        wsConnected = false
-        if CONFIG.PRINT_LOG then
-            warn("[RayanSpy] WS send failed:", err)
-        end
-    end
-end
-
-local function tryConnect()
-    local url = string.format("ws://%s:%d", CONFIG.WS_HOST, CONFIG.WS_PORT)
-    local ok, result = pcall(function()
-        return WebSocket.connect(url)
-    end)
-    if ok and result then
-        ws          = result
-        wsConnected = true
-        if CONFIG.PRINT_LOG then
-            print("[RayanSpy] Connected to UI @", url)
-        end
-        ws.OnClose:Connect(function()
-            wsConnected = false
-            if CONFIG.PRINT_LOG then
-                warn("[RayanSpy] WS closed.")
-            end
-        end)
-    else
-        wsConnected = false
-        if CONFIG.PRINT_LOG then
-            warn("[RayanSpy] WS connect failed:", result)
-        end
-    end
-end
-
-tryConnect()
 
 -- ─── HOOK ──────────────────────────────────────────────────────
 local mt = getrawmetatable(game)
 setreadonly(mt, false)
-
 local oldNamecall = mt.__namecall
 hookActive = true
 
@@ -262,22 +160,21 @@ mt.__namecall = newcclosure(function(self, ...)
     local method = getnamecallmethod()
 
     if method == "FireServer" or method == "InvokeServer" then
-        local ok1, className = pcall(function()
-            return typeof(self) == "Instance" and self.ClassName or ""
+        local ok1, cls = pcall(function()
+            return (typeof(self)=="Instance") and self.ClassName or ""
         end)
-        local cls = ok1 and className or ""
+        cls = ok1 and cls or ""
 
         if cls == "RemoteEvent" or cls == "RemoteFunction" then
-            local ok2, remoteName = pcall(function() return self.Name end)
-            local name = ok2 and remoteName or "?"
+            local ok2, name = pcall(function() return self.Name end)
+            name = ok2 and name or "?"
 
             if not blacklistSet[name] then
-                -- table.pack preserves nil holes via .n
-                local argPack = table.pack(...)
+                local argPack  = table.pack(...)
                 local fullPath = ""
                 pcall(function() fullPath = self:GetFullName() end)
 
-                local payload = {
+                local entry = {
                     id       = os.clock(),
                     path     = fullPath,
                     remote   = name,
@@ -288,92 +185,66 @@ mt.__namecall = newcclosure(function(self, ...)
                     time     = os.date("%H:%M:%S"),
                 }
 
-                table.insert(remoteLog, payload)
+                table.insert(remoteLog, entry)
                 if #remoteLog > CONFIG.MAX_LOG then
                     table.remove(remoteLog, 1)
                 end
 
-                -- protected send — hook must never crash
-                pcall(sendToUI, { type = "remote", data = payload })
+                pcall(sendToUI, {type="remote", data=entry})
 
                 if CONFIG.PRINT_LOG then
-                    print(string.format(
-                        "[RayanSpy] %s :: %s | %d arg(s)",
-                        fullPath, method, argPack.n
-                    ))
+                    print(string.format("[RayanSpy] %s :: %s | %d args",
+                        fullPath, method, argPack.n))
                 end
             end
         end
     end
 
-    -- call original, re-raise errors so game logic sees them
-    local results = table.pack(pcall(oldNamecall, self, ...))
-    if not results[1] then
-        error(results[2], 2)
-    end
-    return table.unpack(results, 2, results.n)
+    local res = table.pack(pcall(oldNamecall, self, ...))
+    if not res[1] then error(res[2], 2) end
+    return table.unpack(res, 2, res.n)
 end)
 
 setreadonly(mt, true)
 
--- ─── PUBLIC API ────────────────────────────────────────────────
-_G.RayanSpy = {
-    getLog = function()
-        return remoteLog
-    end,
+-- try UI connection async — never blocks
+tryConnectAsync()
 
-    count = function()
-        return #remoteLog
-    end,
+-- ─── API ────────────────────────────────────────────────────────
+_G.RayanSpy = {
+    getLog = function() return remoteLog end,
+    count  = function() return #remoteLog end,
 
     dump = function()
-        if #remoteLog == 0 then
-            print("[RayanSpy] No remotes captured yet.")
-            return
-        end
-        print(string.format("[RayanSpy] === %d Remotes ===", #remoteLog))
+        if #remoteLog == 0 then print("[RayanSpy] Nothing captured."); return end
+        print(string.format("[RayanSpy] %d remotes:", #remoteLog))
         for i, r in ipairs(remoteLog) do
-            print(string.format(
-                "  [%d] %s :: %s | args: %d | %s",
-                i, r.path, r.method, r.argCount, r.time
-            ))
+            print(string.format("  [%d] %s :: %s | %d args @ %s",
+                i, r.path, r.method, r.argCount, r.time))
         end
     end,
 
     clear = function()
         remoteLog = {}
-        pcall(sendToUI, { type = "clear" })
-        print("[RayanSpy] Log cleared.")
+        pcall(sendToUI, {type="clear"})
+        print("[RayanSpy] Cleared.")
     end,
 
     unhook = function()
-        if not hookActive then
-            print("[RayanSpy] Already unhooked.")
-            return
-        end
-        local mt2 = getrawmetatable(game)
-        setreadonly(mt2, false)
-        mt2.__namecall = oldNamecall
-        setreadonly(mt2, true)
+        if not hookActive then print("[RayanSpy] Already unhooked."); return end
+        local m = getrawmetatable(game)
+        setreadonly(m, false)
+        m.__namecall = oldNamecall
+        setreadonly(m, true)
         hookActive = false
-        if ws and wsConnected then
-            pcall(function() ws:Close() end)
-        end
-        wsConnected = false
-        print("[RayanSpy] Unhooked. Original __namecall restored.")
+        if ws and wsConnected then pcall(function() ws:Close() end) end
+        print("[RayanSpy] Unhooked.")
     end,
 
     reconnect = function()
-        if wsConnected then
-            pcall(function() ws:Close() end)
-            wsConnected = false
-        end
-        tryConnect()
-        print("[RayanSpy] Reconnect attempted.")
+        if wsConnected then pcall(function() ws:Close() end); wsConnected=false end
+        tryConnectAsync()
     end,
 }
 
-print(string.format(
-    "[RayanSpy v2.0] Hooked. UI: ws://localhost:%d | API: _G.RayanSpy",
-    CONFIG.WS_PORT
-))
+print("[RayanSpy v2.1] Hooked. _G.RayanSpy ready. Call _G.RayanSpy.dump() to see remotes.")
